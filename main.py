@@ -28,6 +28,7 @@ app.add_middleware(
         "http://localhost:3000",
         "http://127.0.0.1:3000", 
         "https://your-frontend-domain.com",
+        "https://chat-bot-frontend-0s4i.onrender.com"
         "https://*.vercel.app"  # Allow Vercel deployments
     ],
     allow_credentials=True,
