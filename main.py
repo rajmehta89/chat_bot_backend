@@ -27,6 +27,8 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "https://your-frontend-domain.com",
         "https://chat-bot-frontend-wbpt.onrender.com",
+        "https://chat-bot-backend-mhmj.onrender.com",
+        "https://*.onrender.com",
         "https://*.vercel.app"  # Allow Vercel deployments
     ],
     allow_credentials=True,
