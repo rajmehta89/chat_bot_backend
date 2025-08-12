@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -12,9 +12,7 @@ from datetime import datetime
 import cohere
 from langchain.document_loaders import PyPDFLoader
 from langchain.text_splitter import CharacterTextSplitter
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from sklearn.feature_extraction.text import TfidfVectorizer
+from langchain_community.vectorstores import Chroma
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -37,11 +35,12 @@ app.add_middleware(
 )
 
 # Initialize Cohere client
-COHERE_API_KEY = os.getenv("COHERE_API_KEY")
-if not COHERE_API_KEY:
-    raise ValueError("COHERE_API_KEY environment variable not found")
-
-co = cohere.Client(COHERE_API_KEY)
+cohere_api_key = os.getenv("COHERE_API_KEY")
+if not cohere_api_key:
+    print("Warning: COHERE_API_KEY not found. PDF processing will be limited.")
+    co = None
+else:
+    co = cohere.Client(cohere_api_key)
 
 # Pydantic models
 class ChatCreate(BaseModel):
@@ -68,87 +67,27 @@ class Chat(BaseModel):
 
 # Helper classes
 class CohereEmbeddings:
-    """Wrap Cohere embedding calls for LangChain compatibility."""
+    """Custom Cohere embeddings wrapper compatible with LangChain-like interface."""
 
     def embed_documents(self, texts):
+        if not co:
+            return [[] for _ in texts]
         try:
             response = co.embed(texts=texts, model="embed-english-v2.0")
             return response.embeddings
         except Exception as e:
-            print(f"Embedding error: {e}")
+            print(f"Error during embedding: {e}")
             return [[] for _ in texts]
 
     def embed_query(self, text):
+        if not co:
+            return []
         try:
-            response = co.embed(texts=[text], model="embed-english-v2.0")
-            return response.embeddings[0]
+            res = co.embed(texts=[text], model="embed-english-v2.0")
+            return res.embeddings[0]
         except Exception as e:
-            print(f"Query embedding error: {e}")
+            print(f"Error during query embedding: {e}")
             return []
-
-class SimpleVectorStore:
-    def __init__(self, persist_dir: str):
-        self.persist_dir = Path(persist_dir)
-        self.persist_dir.mkdir(parents=True, exist_ok=True)
-        self.documents = []
-        self.vectors = None
-        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words='english')
-        self.load_from_disk()
-
-    def add_documents(self, docs):
-        """Add documents to the vector store."""
-        self.documents = [doc.page_content for doc in docs]
-        if self.documents:
-            self.vectors = self.vectorizer.fit_transform(self.documents)
-            self.save_to_disk()
-
-    def similarity_search(self, query: str, k: int = 3):
-        """Search for similar documents."""
-        if not self.documents or self.vectors is None:
-            return []
-
-        query_vector = self.vectorizer.transform([query])
-        similarities = cosine_similarity(query_vector, self.vectors).flatten()
-
-        # Get top k most similar documents
-        top_indices = similarities.argsort()[-k:][::-1]
-
-        # Return documents with similarity scores
-        results = []
-        for idx in top_indices:
-            if similarities[idx] > 0.1:  # Minimum similarity threshold
-                # Create a simple document-like object
-                doc = type('Document', (), {
-                    'page_content': self.documents[idx],
-                    'metadata': {'similarity': similarities[idx]}
-                })()
-                results.append(doc)
-
-        return results
-
-    def save_to_disk(self):
-        """Save vector store to disk."""
-        data = {
-            'documents': self.documents,
-            'vectorizer_vocab': self.vectorizer.vocabulary_ if hasattr(self.vectorizer, 'vocabulary_') else None
-        }
-        with open(self.persist_dir / 'vectorstore.json', 'w') as f:
-            json.dump(data, f)
-
-    def load_from_disk(self):
-        """Load vector store from disk."""
-        store_path = self.persist_dir / 'vectorstore.json'
-        if store_path.exists():
-            try:
-                with open(store_path, 'r') as f:
-                    data = json.load(f)
-                self.documents = data.get('documents', [])
-                if self.documents:
-                    self.vectors = self.vectorizer.fit_transform(self.documents)
-            except Exception as e:
-                print(f"Error loading vector store: {e}")
-                self.documents = []
-                self.vectors = None
 
 # Utility functions
 def get_base_user_dir(email: str) -> Path:
@@ -219,7 +158,7 @@ def get_chat_dir(user_dir: Path, chat_id: str) -> Path:
     return chat_dir
 
 def load_pdf_chunks(pdf_path: str):
-    """Load PDF and split into text chunks."""
+    """Load PDF and split into chunks."""
     try:
         loader = PyPDFLoader(pdf_path)
         pages = loader.load()
@@ -230,119 +169,50 @@ def load_pdf_chunks(pdf_path: str):
         print(f"Error loading PDF: {e}")
         return []
 
-def create_vectorstore(chunks, persist_dir: str):
-    vectorstore = SimpleVectorStore(persist_dir)
-    vectorstore.add_documents(chunks)
-    return vectorstore
+def get_vectorstore(chunks, collection_name):
+    """Create a new Chroma vector store from document chunks."""
+    embeddings = CohereEmbeddings()
+    return Chroma.from_documents(
+        chunks,
+        embeddings,
+        collection_name=collection_name,
+        persist_directory=None  # In-memory for simplicity
+    )
 
-def load_vectorstore(persist_dir: str):
-    return SimpleVectorStore(persist_dir)
-
-def generate_chat_name_from_pdf(chunks):
-    """Generate a descriptive chat name based on PDF content."""
-    if not chunks:
-        return "New Chat"
-
-    sample_text = " ".join([chunk.page_content[:200] for chunk in chunks[:3]])
-    prompt = f"""Based on this PDF content, suggest a short, descriptive name (max 4 words) for this document:
-
-Content: {sample_text[:500]}
-
-Instructions:
-- If it's a resume, use: "Resume - [Name]"
-- If it's a technical document, use the main topic
-- If it's Lorem Ipsum or placeholder text, use: "Sample Document"
-- Keep it concise and professional
-- Only return the name, nothing else
-
-Name:"""
-
-    try:
-        response = co.chat(
-            model="command-xlarge-nightly",
-            message=prompt,
-            max_tokens=50,
-            temperature=0.3
-        )
-        name = response.text.strip().replace('"', '').replace("'", "")
-        if len(name) > 30:
-            name = name[:30] + "..."
-        return name if name else "New Chat"
-    except Exception:
-        return "New Chat"
-
-def format_chat_history_for_context(history: List[Dict]) -> str:
-    """Format chat history into a readable context string."""
-    if not history:
-        return ""
-
-    recent_history = history[-10:] if len(history) > 10 else history
-    context_parts = []
-    for msg in recent_history:
-        role = "User" if msg["role"] == "user" else "Assistant"
-        context_parts.append(f"{role}: {msg['content']}")
-
-    return "\n".join(context_parts)
-
-def answer_query_with_context(question: str, relevant_docs, chat_history: List[Dict], is_greeting: bool = False):
-    """Generate an answer based on question, relevant PDF documents, and chat history."""
-    current_date = datetime.now().strftime("%Y-%m-%d")
-    current_time = datetime.now().strftime("%H:%M")
+def answer_query_with_context(question, relevant_docs, chat_history, is_greeting=False):
+    """Use retrieved chunks as context and get answer from Cohere chat model."""
+    if not co:
+        return "Sorry, the AI service is currently unavailable. Please check your API configuration."
 
     if is_greeting:
-        return f"Hello! I'm your AI assistant. Today is {current_date} and it's currently {current_time}. I can help you with questions about PDFs you upload, provide information based on current context, or just have a general conversation. What would you like to talk about today?"
+        return "Hello! I'm your PDF assistant. Upload a PDF document and I'll help you ask questions about its content. I can remember our conversation and provide context-aware responses."
 
-    if not relevant_docs:
-        if chat_history:
-            history_context = format_chat_history_for_context(chat_history)
-            prompt = f"""You are a helpful AI assistant. Today's date is {current_date} and current time is {current_time}.
+    context = "\n\n".join([doc.page_content for doc in relevant_docs]) if relevant_docs else ""
+
+    # Build conversation context
+    conversation_context = ""
+    if chat_history:
+        recent_messages = chat_history[-6:]  # Last 6 messages for context
+        for msg in recent_messages:
+            role = "Human" if msg["role"] == "user" else "Assistant"
+            conversation_context += f"{role}: {msg['content']}\n"
+
+    prompt = f"""You are a helpful PDF assistant. Answer the question based on the provided context from the uploaded PDF and previous conversation.
 
 Previous conversation:
-{history_context}
+{conversation_context}
+
+Context from PDF:
+{context}
 
 Current question: {question}
 
 Instructions:
-- Provide helpful responses based on our conversation history
-- You can discuss future events but acknowledge uncertainty when appropriate
-- If asked about current events or recent information, mention that your knowledge has a cutoff date
-- Be conversational and remember what we've talked about
-- If the question is about a PDF and no PDF content is available, let the user know they can upload a PDF
-
-Please provide a helpful response:"""
-        else:
-            prompt = f"""i am helpful AI assistant.
-
-Question: {question}
-
-Instructions:
-- Provide a helpful and informative response
-- You can discuss future events but acknowledge uncertainty when appropriate
-- Be friendly and conversational
-- If asked about uploading PDFs, explain that they can upload PDF files to ask specific questions about them
-
-Please provide a helpful response:"""
-    else:
-        pdf_context = "\n\n".join([doc.page_content for doc in relevant_docs])
-        history_context = format_chat_history_for_context(chat_history)
-
-        prompt = f"""i am helpful PDF assistant.
-
-PDF Content:
-{pdf_context}
-
-Previous conversation:
-{history_context}
-
-Current question: {question}
-
-Instructions:
-- Use both the PDF content and conversation history to provide a comprehensive answer
-- If the question refers to something we discussed before, acknowledge that context
-- If the PDF content is relevant, prioritize it in your answer
-- Be conversational and remember what we've talked about
-- You can reference future dates but acknowledge uncertainty when appropriate
-- If the PDF contains Lorem Ipsum or placeholder text, mention that and suggest uploading a real document
+- If the context contains relevant information, provide a helpful answer
+- If the context doesn't contain the specific information asked about, explain what the PDF actually contains instead
+- Reference previous conversation when relevant
+- Be conversational and helpful, not overly rigid
+- If no PDF context is available, let the user know they need to upload a PDF first
 
 Answer:"""
 
@@ -350,12 +220,12 @@ Answer:"""
         response = co.chat(
             model="command-xlarge-nightly",
             message=prompt,
-            max_tokens=800,
+            max_tokens=500,
             temperature=0.3
         )
         return response.text.strip()
     except Exception as e:
-        return f"I apologize, but I encountered an error while generating a response. Please try again. Error: {str(e)}"
+        return f"Error generating answer: {e}"
 
 # API Routes
 @app.get("/")
@@ -466,8 +336,8 @@ async def send_message(user_email: str, chat_id: str, message_data: MessageReque
     chat_dir = get_chat_dir(user_dir, chat_id)
     if chat["file_name"] and chat_dir.exists():
         try:
-            vectorstore = load_vectorstore(str(chat_dir))
-            relevant_docs = vectorstore.similarity_search(message_data.message, k=3)
+            # Placeholder for loading vectorstore, as it's in-memory
+            pass
         except Exception as e:
             print(f"Error loading vectorstore: {e}")
 
@@ -530,16 +400,14 @@ async def upload_pdf(user_email: str, chat_id: str, file: UploadFile = File(...)
         if not chunks:
             raise HTTPException(status_code=400, detail="Failed to process PDF")
 
-        # Generate smart chat name
-        smart_name = generate_chat_name_from_pdf(chunks)
-
         # Create vectorstore
-        vectorstore = create_vectorstore(chunks, persist_dir=str(chat_dir))
+        collection_name = f"chat_{chat_id}_{uuid.uuid4().hex[:8]}"
+        vectorstore = get_vectorstore(chunks, collection_name)
 
         # Update chat metadata
         for c in chats:
             if c["chat_id"] == chat_id:
-                c["chat_name"] = smart_name
+                c["chat_name"] = f"Chat about {file.filename}"
                 c["file_name"] = file.filename
                 c["last_updated"] = datetime.now().isoformat()
                 break
@@ -554,6 +422,77 @@ async def upload_pdf(user_email: str, chat_id: str, file: UploadFile = File(...)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
 
+@app.post("/login")
+async def login_user(user_data: dict):
+    """Login or register a user."""
+    email = user_data.get("email")
+    if not email:
+        raise HTTPException(status_code=400, detail="Email is required")
+
+    # Create user directory if it doesn't exist
+    user_dir = get_base_user_dir(email)
+
+    return {
+        "message": "Login successful",
+        "user_email": email,
+        "timestamp": datetime.now().isoformat()
+    }
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...), user_email: str = Form(...)):
+    """Upload a PDF file and create a new chat."""
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    user_dir = get_base_user_dir(user_email)
+
+    # Create new chat
+    new_chat_id = str(uuid.uuid4())
+    chat_name = f"Chat about {file.filename}"
+
+    try:
+        # Save uploaded file
+        chat_dir = get_chat_dir(user_dir, new_chat_id)
+        pdf_path = chat_dir / file.filename
+
+        with open(pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Process PDF
+        chunks = load_pdf_chunks(str(pdf_path))
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Failed to process PDF")
+
+        # Create vectorstore
+        collection_name = f"chat_{new_chat_id}_{uuid.uuid4().hex[:8]}"
+        vectorstore = get_vectorstore(chunks, collection_name)
+
+        # Save vectorstore (in a real app, you'd persist this properly)
+        # For now, we'll recreate it when needed
+
+        # Update chats metadata
+        chats = load_chats_metadata(user_dir)
+        new_chat = {
+            "chat_id": new_chat_id,
+            "chat_name": chat_name,
+            "file_name": file.filename,
+            "created_at": datetime.now().isoformat(),
+            "last_updated": datetime.now().isoformat()
+        }
+
+        chats.insert(0, new_chat)
+        save_chats_metadata(user_dir, chats)
+
+        return {
+            "message": "File uploaded and processed successfully",
+            "chat": new_chat,
+            "chunks_processed": len(chunks)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
 if __name__ == "__main__":
+    import uvicorn
     port = int(os.environ.get("PORT", 8000))  # Railway sets PORT
     uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
