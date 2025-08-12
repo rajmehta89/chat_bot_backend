@@ -28,6 +28,7 @@ app.add_middleware(
         "https://your-frontend-domain.com",
         "https://chat-bot-frontend-wbpt.onrender.com",
         "https://chat-bot-backend-mhmj.onrender.com",
+        "https://chat-bot-frontend-awui.onrender.com",
         "https://*.onrender.com",
         "https://*.vercel.app"  # Allow Vercel deployments
     ],
