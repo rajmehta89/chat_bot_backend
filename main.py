@@ -65,6 +65,7 @@ class Chat(BaseModel):
     chat_id: str
     chat_name: str
     file_name: str
+    vectorstore_path: Optional[str] = None
     created_at: str
     last_updated: str
 
@@ -172,15 +173,25 @@ def load_pdf_chunks(pdf_path: str):
         print(f"Error loading PDF: {e}")
         return []
 
-def get_vectorstore(chunks, collection_name):
-    """Create a new Chroma vector store from document chunks."""
+def create_vectorstore(chunks, persist_dir: str):
+    """Create a new Chroma vector store from document chunks with persistence."""
     embeddings = CohereEmbeddings()
-    return Chroma.from_documents(
-        chunks,
-        embeddings,
-        collection_name=collection_name,
-        persist_directory=None  # In-memory for simplicity
-    )
+    return Chroma.from_documents(chunks, embeddings, persist_directory=persist_dir)
+
+def load_vectorstore(persist_dir: str):
+    """Load existing vectorstore from disk."""
+    embeddings = CohereEmbeddings()
+    return Chroma(persist_directory=persist_dir, embedding_function=embeddings)
+
+def format_chat_history_for_context(chat_history):
+    """Format chat history for context."""
+    conversation_context = ""
+    if chat_history:
+        recent_messages = chat_history[-6:]  # Last 6 messages for context
+        for msg in recent_messages:
+            role = "Human" if msg["role"] == "user" else "Assistant"
+            conversation_context += f"{role}: {msg['content']}\n"
+    return conversation_context
 
 def answer_query_with_context(question, relevant_docs, chat_history, is_greeting=False):
     """Use retrieved chunks as context and get answer from Cohere chat model."""
@@ -188,49 +199,39 @@ def answer_query_with_context(question, relevant_docs, chat_history, is_greeting
         return "Sorry, the AI service is currently unavailable. Please check your API configuration."
 
     if is_greeting:
-        return "Hello! I'm your AI assistant. I can help you with questions about uploaded PDFs or have general conversations. Feel free to ask me anything!"
+        return "Hello! I'm your AI assistant. Feel free to ask me anything!"
 
-    context = "\n\n".join([doc.page_content for doc in relevant_docs]) if relevant_docs else ""
-
-    # Build conversation context
-    conversation_context = ""
-    if chat_history:
-        recent_messages = chat_history[-6:]  # Last 6 messages for context
-        for msg in recent_messages:
-            role = "Human" if msg["role"] == "user" else "Assistant"
-            conversation_context += f"{role}: {msg['content']}\n"
-
-    if context:
-        prompt = f"""You are a helpful AI assistant. Answer the question based on the provided context from the uploaded PDF and previous conversation.
+    if not relevant_docs:
+        if chat_history:
+            history_context = format_chat_history_for_context(chat_history)
+            prompt = f"""You are a helpful AI assistant. Continue the conversation based on our chat history.
 
 Previous conversation:
-{conversation_context}
-
-Context from PDF:
-{context}
+{history_context}
 
 Current question: {question}
 
-Instructions:
-- If the context contains relevant information, provide a helpful answer
-- If the context doesn't contain the specific information asked about, explain what the PDF actually contains instead
-- Reference previous conversation when relevant
-- Be conversational and helpful
-
-Answer:"""
+Please provide a helpful response."""
+        else:
+            return "Hello! I'm your AI assistant. Feel free to ask me anything!"
     else:
-        prompt = f"""You are a helpful AI assistant. Answer the question based on the previous conversation context.
+        pdf_context = "\n\n".join([doc.page_content for doc in relevant_docs])
+        history_context = format_chat_history_for_context(chat_history)
+        prompt = f"""You are a helpful AI assistant. Answer the question based on the PDF content and our conversation history.
+
+PDF Content:
+{pdf_context}
 
 Previous conversation:
-{conversation_context}
+{history_context}
 
 Current question: {question}
 
 Instructions:
-- Provide a helpful and informative answer
-- Be conversational and engaging
-- If this seems like a general question, answer it directly
-- Reference previous conversation when relevant
+- Use both the PDF content and conversation history to provide a comprehensive answer
+- If the question refers to something we discussed before, acknowledge that context
+- If the PDF content is relevant, prioritize it in your answer
+- Be conversational and remember what we've talked about
 
 Answer:"""
 
@@ -238,13 +239,12 @@ Answer:"""
         response = co.chat(
             model="command-xlarge-nightly",
             message=prompt,
-            max_tokens=500,
-            temperature=0.7
+            max_tokens=800,
+            temperature=0.3
         )
         return response.text.strip()
     except Exception as e:
-        print(f"Error generating response: {e}")
-        return "I apologize, but I'm having trouble generating a response right now. Please try again."
+        return f"Error generating answer: {e}"
 
 # API Routes
 @app.get("/")
@@ -300,6 +300,7 @@ async def create_chat(user_email: str, chat_data: ChatCreate):
         "chat_id": new_chat_id,
         "chat_name": chat_data.chat_name,
         "file_name": "",
+        "vectorstore_path": None,
         "created_at": datetime.now().isoformat(),
         "last_updated": datetime.now().isoformat()
     }
@@ -357,13 +358,12 @@ async def send_message(user_email: str, chat_id: str, message_data: MessageReque
     if not message_data.is_greeting:
         add_message_to_history(user_dir, chat_id, "user", message_data.message)
 
-    # Load vectorstore if available
     relevant_docs = []
     chat_dir = get_chat_dir(user_dir, chat_id)
-    if chat["file_name"] and chat_dir.exists():
+    if chat.get("vectorstore_path") and Path(chat["vectorstore_path"]).exists():
         try:
-            # Placeholder for loading vectorstore, as it's in-memory
-            pass
+            vectorstore = load_vectorstore(chat["vectorstore_path"])
+            relevant_docs = vectorstore.similarity_search(message_data.message, k=3)
         except Exception as e:
             print(f"Error loading vectorstore: {e}")
 
@@ -395,8 +395,7 @@ async def send_message(user_email: str, chat_id: str, message_data: MessageReque
             "role": "assistant",
             "content": ai_response,
             "timestamp": datetime.now().isoformat()
-        },
-        "updated_chat": chat
+        }
     }
 
 @app.post("/chats/{user_email}/{chat_id}/upload")
@@ -426,15 +425,14 @@ async def upload_pdf(user_email: str, chat_id: str, file: UploadFile = File(...)
         if not chunks:
             raise HTTPException(status_code=400, detail="Failed to process PDF")
 
-        # Create vectorstore
-        collection_name = f"chat_{chat_id}_{uuid.uuid4().hex[:8]}"
-        vectorstore = get_vectorstore(chunks, collection_name)
+        vectorstore = create_vectorstore(chunks, persist_dir=str(chat_dir))
 
         # Update chat metadata
         for c in chats:
             if c["chat_id"] == chat_id:
                 c["chat_name"] = f"Chat about {file.filename}"
                 c["file_name"] = file.filename
+                c["vectorstore_path"] = str(chat_dir)
                 c["last_updated"] = datetime.now().isoformat()
                 break
 
@@ -489,12 +487,7 @@ async def upload_file(file: UploadFile = File(...), user_email: str = Form(...))
         if not chunks:
             raise HTTPException(status_code=400, detail="Failed to process PDF")
 
-        # Create vectorstore
-        collection_name = f"chat_{new_chat_id}_{uuid.uuid4().hex[:8]}"
-        vectorstore = get_vectorstore(chunks, collection_name)
-
-        # Save vectorstore (in a real app, you'd persist this properly)
-        # For now, we'll recreate it when needed
+        vectorstore = create_vectorstore(chunks, persist_dir=str(chat_dir))
 
         # Update chats metadata
         chats = load_chats_metadata(user_dir)
@@ -502,6 +495,7 @@ async def upload_file(file: UploadFile = File(...), user_email: str = Form(...))
             "chat_id": new_chat_id,
             "chat_name": chat_name,
             "file_name": file.filename,
+            "vectorstore_path": str(chat_dir),
             "created_at": datetime.now().isoformat(),
             "last_updated": datetime.now().isoformat()
         }
@@ -569,14 +563,12 @@ async def query_chat(user_email: str, chat_id: str, query_data: MessageRequest):
     # Add user message to history
     add_message_to_history(user_dir, chat_id, "user", query_data.message)
 
-    # Load vectorstore if available
     relevant_docs = []
     chat_dir = get_chat_dir(user_dir, chat_id)
-    if chat["file_name"] and chat_dir.exists():
+    if chat.get("vectorstore_path") and Path(chat["vectorstore_path"]).exists():
         try:
-            # For now, we'll use the existing PDF processing logic
-            # In a full implementation, you'd load the actual vectorstore
-            pass
+            vectorstore = load_vectorstore(chat["vectorstore_path"])
+            relevant_docs = vectorstore.similarity_search(query_data.message, k=3)
         except Exception as e:
             print(f"Error loading vectorstore: {e}")
 
@@ -608,8 +600,7 @@ async def query_chat(user_email: str, chat_id: str, query_data: MessageRequest):
             "role": "assistant",
             "content": ai_response,
             "timestamp": datetime.now().isoformat()
-        },
-        "updated_chat": chat
+        }
     }
 
 @app.post("/chats/{user_email}/upload-and-create")
@@ -627,6 +618,7 @@ async def upload_and_create_chat(user_email: str, file: UploadFile = File(...)):
         "chat_id": new_chat_id,
         "chat_name": f"Chat about {file.filename}",
         "file_name": file.filename,
+        "vectorstore_path": None,
         "created_at": datetime.now().isoformat(),
         "last_updated": datetime.now().isoformat()
     }
@@ -644,9 +636,8 @@ async def upload_and_create_chat(user_email: str, file: UploadFile = File(...)):
         if not chunks:
             raise HTTPException(status_code=400, detail="Failed to process PDF")
 
-        # Create vectorstore
-        collection_name = f"chat_{new_chat_id}_{uuid.uuid4().hex[:8]}"
-        vectorstore = get_vectorstore(chunks, collection_name)
+        vectorstore = create_vectorstore(chunks, persist_dir=str(chat_dir))
+        new_chat["vectorstore_path"] = str(chat_dir)
 
         # Add to chats list
         chats.insert(0, new_chat)
