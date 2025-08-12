@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-app = FastAPI(title="PDF Q&A Chatbot API", version="1.0.0")
+app = FastAPI(title="PDF Q&A Chatbot API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -234,10 +234,17 @@ Answer:"""
 @app.get("/")
 async def root():
     return {
-        "message": "PDF Q&A Chatbot API is running",
-        "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "version": "1.0.0"
+        "message": "Welcome to your AI-powered PDF Chat Assistant! 🤖",
+        "description": "Upload any PDF document and start having intelligent conversations about its content. Ask questions, get summaries, or explore topics - I'm here to help you understand your documents better.",
+        "features": [
+            "Upload and chat with PDF documents",
+            "Create and manage multiple chat sessions", 
+            "Get context-aware responses based on document content",
+            "Maintain conversation history across sessions"
+        ],
+        "getting_started": "Simply upload a PDF file and start asking questions about it!",
+        "status": "ready",
+        "version": "2.0.0"
     }
 
 @app.get("/health")
