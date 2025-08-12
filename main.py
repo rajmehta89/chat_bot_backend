@@ -188,7 +188,7 @@ def answer_query_with_context(question, relevant_docs, chat_history, is_greeting
         return "Sorry, the AI service is currently unavailable. Please check your API configuration."
 
     if is_greeting:
-        return "Hello! I'm your PDF assistant. Upload a PDF document and I'll help you ask questions about its content. I can remember our conversation and provide context-aware responses."
+        return "Hello! I'm your AI assistant. I can help you with questions about uploaded PDFs or have general conversations. Feel free to ask me anything!"
 
     context = "\n\n".join([doc.page_content for doc in relevant_docs]) if relevant_docs else ""
 
@@ -200,7 +200,8 @@ def answer_query_with_context(question, relevant_docs, chat_history, is_greeting
             role = "Human" if msg["role"] == "user" else "Assistant"
             conversation_context += f"{role}: {msg['content']}\n"
 
-    prompt = f"""You are a helpful PDF assistant. Answer the question based on the provided context from the uploaded PDF and previous conversation.
+    if context:
+        prompt = f"""You are a helpful AI assistant. Answer the question based on the provided context from the uploaded PDF and previous conversation.
 
 Previous conversation:
 {conversation_context}
@@ -214,8 +215,22 @@ Instructions:
 - If the context contains relevant information, provide a helpful answer
 - If the context doesn't contain the specific information asked about, explain what the PDF actually contains instead
 - Reference previous conversation when relevant
-- Be conversational and helpful, not overly rigid
-- If no PDF context is available, let the user know they need to upload a PDF first
+- Be conversational and helpful
+
+Answer:"""
+    else:
+        prompt = f"""You are a helpful AI assistant. Answer the question based on the previous conversation context.
+
+Previous conversation:
+{conversation_context}
+
+Current question: {question}
+
+Instructions:
+- Provide a helpful and informative answer
+- Be conversational and engaging
+- If this seems like a general question, answer it directly
+- Reference previous conversation when relevant
 
 Answer:"""
 
@@ -224,11 +239,12 @@ Answer:"""
             model="command-xlarge-nightly",
             message=prompt,
             max_tokens=500,
-            temperature=0.3
+            temperature=0.7
         )
         return response.text.strip()
     except Exception as e:
-        return f"Error generating answer: {e}"
+        print(f"Error generating response: {e}")
+        return "I apologize, but I'm having trouble generating a response right now. Please try again."
 
 # API Routes
 @app.get("/")
@@ -501,6 +517,160 @@ async def upload_file(file: UploadFile = File(...), user_email: str = Form(...))
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+@app.delete("/chats/{user_email}/{chat_id}")
+async def delete_chat(user_email: str, chat_id: str):
+    """Delete a chat and all associated files."""
+    user_dir = get_base_user_dir(user_email)
+    chats = load_chats_metadata(user_dir)
+
+    # Find and remove the chat
+    chat_to_delete = None
+    updated_chats = []
+    for chat in chats:
+        if chat["chat_id"] == chat_id:
+            chat_to_delete = chat
+        else:
+            updated_chats.append(chat)
+
+    if not chat_to_delete:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    try:
+        # Clean up chat files
+        chat_dir = get_chat_dir(user_dir, chat_id)
+        if chat_dir.exists():
+            shutil.rmtree(chat_dir, ignore_errors=True)
+        
+        # Clean up chat history
+        history_path = get_chat_history_path(user_dir, chat_id)
+        if history_path.exists():
+            history_path.unlink()
+
+        # Save updated chats metadata
+        save_chats_metadata(user_dir, updated_chats)
+
+        return {"message": "Chat deleted successfully"}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error deleting chat: {str(e)}")
+
+@app.post("/chats/{user_email}/{chat_id}/query")
+async def query_chat(user_email: str, chat_id: str, query_data: MessageRequest):
+    """Send a query with enhanced context awareness."""
+    user_dir = get_base_user_dir(user_email)
+    chats = load_chats_metadata(user_dir)
+
+    # Find the chat
+    chat = next((c for c in chats if c["chat_id"] == chat_id), None)
+    if not chat:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    # Add user message to history
+    add_message_to_history(user_dir, chat_id, "user", query_data.message)
+
+    # Load vectorstore if available
+    relevant_docs = []
+    chat_dir = get_chat_dir(user_dir, chat_id)
+    if chat["file_name"] and chat_dir.exists():
+        try:
+            # For now, we'll use the existing PDF processing logic
+            # In a full implementation, you'd load the actual vectorstore
+            pass
+        except Exception as e:
+            print(f"Error loading vectorstore: {e}")
+
+    # Get chat history (excluding current message)
+    chat_history = load_chat_history(user_dir, chat_id)
+    if chat_history:
+        chat_history = chat_history[:-1]  # Exclude the just-added user message
+
+    # Generate AI response
+    ai_response = answer_query_with_context(
+        query_data.message,
+        relevant_docs,
+        chat_history,
+        query_data.is_greeting
+    )
+
+    # Add AI response to history
+    add_message_to_history(user_dir, chat_id, "assistant", ai_response)
+
+    # Update chat timestamp
+    for c in chats:
+        if c["chat_id"] == chat_id:
+            c["last_updated"] = datetime.now().isoformat()
+            break
+    save_chats_metadata(user_dir, chats)
+
+    return {
+        "assistant_message": {
+            "role": "assistant",
+            "content": ai_response,
+            "timestamp": datetime.now().isoformat()
+        },
+        "updated_chat": chat
+    }
+
+@app.post("/chats/{user_email}/upload-and-create")
+async def upload_and_create_chat(user_email: str, file: UploadFile = File(...)):
+    """Upload PDF and automatically create a new chat."""
+    if not file.filename.endswith('.pdf'):
+        raise HTTPException(status_code=400, detail="Only PDF files are allowed")
+
+    user_dir = get_base_user_dir(user_email)
+    chats = load_chats_metadata(user_dir)
+
+    # Create new chat
+    new_chat_id = str(uuid.uuid4())
+    new_chat = {
+        "chat_id": new_chat_id,
+        "chat_name": f"Chat about {file.filename}",
+        "file_name": file.filename,
+        "created_at": datetime.now().isoformat(),
+        "last_updated": datetime.now().isoformat()
+    }
+
+    try:
+        # Save uploaded file
+        chat_dir = get_chat_dir(user_dir, new_chat_id)
+        pdf_path = chat_dir / file.filename
+
+        with open(pdf_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Process PDF
+        chunks = load_pdf_chunks(str(pdf_path))
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Failed to process PDF")
+
+        # Create vectorstore
+        collection_name = f"chat_{new_chat_id}_{uuid.uuid4().hex[:8]}"
+        vectorstore = get_vectorstore(chunks, collection_name)
+
+        # Add to chats list
+        chats.insert(0, new_chat)
+
+        # Limit to max 10 chats
+        if len(chats) > 10:
+            oldest = chats.pop(-1)
+            # Clean up old chat files
+            old_chat_dir = get_chat_dir(user_dir, oldest["chat_id"])
+            if old_chat_dir.exists():
+                shutil.rmtree(old_chat_dir, ignore_errors=True)
+            old_history_path = get_chat_history_path(user_dir, oldest["chat_id"])
+            if old_history_path.exists():
+                old_history_path.unlink()
+
+        save_chats_metadata(user_dir, chats)
+
+        return {
+            "message": "PDF uploaded and chat created successfully",
+            "chat": new_chat
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
